@@ -1,0 +1,100 @@
+name: Validate submission
+
+# 只读取 PR 元数据，不检出或执行报名者提交的代码
+# 使用受信任基准分支中的工作流，避免 Fork 通过修改此文件绕过校验
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+# 读取 PR 的提交和变更文件列表只需要只读权限
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  validate:
+    name: Validate recruitment PR
+    runs-on: ubuntu-latest
+    env:
+      # 从 PR 元数据中推导唯一允许的 GitHubID、标题和个人目录。
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      HEAD_REF: ${{ github.head_ref }}
+    steps:
+      - name: Validate PR metadata, commits, and changed files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 收集所有问题后再失败，方便报名者一次看到完整反馈
+          failed=0
+
+          fail() {
+            echo "::error title=Invalid submission::$1"
+            failed=1
+          }
+
+          if [[ "$BASE_REF" != "main" ]]; then
+            fail "The PR target branch must be main, not $BASE_REF."
+          fi
+
+          # GitHub 用户名允许字母、数字和连字符，长度不超过 39
+          if [[ "$HEAD_REF" =~ ^member/2026/([A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?)$ ]]; then
+            github_id="${BASH_REMATCH[1]}"
+          else
+            fail "The source branch must use member/2026/<GitHubID>; received $HEAD_REF."
+            github_id=""
+          fi
+
+          if [[ -n "$github_id" ]]; then
+            expected_title="member: add-$github_id"
+
+            if [[ "$PR_TITLE" != "$expected_title" ]]; then
+              fail "The PR title must be $expected_title; received $PR_TITLE."
+            fi
+
+            # GitHub API 分页读取全部提交，只比较每条提交的第一行标题
+            commit_count=0
+            while IFS=$'\t' read -r sha subject; do
+              [[ -z "$sha" ]] && continue
+              commit_count=$((commit_count + 1))
+              if [[ "$subject" != "$expected_title" ]]; then
+                fail "Commit ${sha:0:7} must use $expected_title; received $subject."
+              fi
+            done < <(
+              gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/commits?per_page=100" \
+                --jq '.[] | [.sha, (.commit.message | split("\n")[0])] | @tsv'
+            )
+
+            if [[ "$commit_count" -eq 0 ]]; then
+              fail "The PR must contain at least one commit."
+            fi
+
+            # 仅允许改动与来源分支 GitHubID 对应的个人目录
+            changed_file_count=0
+            expected_directory="members/2026/$github_id/"
+            while IFS= read -r filename; do
+              [[ -z "$filename" ]] && continue
+              changed_file_count=$((changed_file_count + 1))
+              if [[ "$filename" != "$expected_directory"* ]]; then
+                fail "Only files under $expected_directory may change; found $filename."
+              fi
+            done < <(
+              gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+                --jq '.[].filename'
+            )
+
+            if [[ "$changed_file_count" -eq 0 ]]; then
+              fail "The PR must change at least one file."
+            fi
+          fi
+
+          if [[ "$failed" -ne 0 ]]; then
+            exit 1
+          fi
+
+          echo "Submission format is valid for $github_id."
